@@ -1,0 +1,19 @@
+{
+    "name": "psd2tscn",
+    "version": "0.1.0",
+    "description": "Convert PSD files to Godot 4 .tscn scenes (standalone, no Cocos dependency)",
+    "main": "psd2tscn.js",
+    "scripts": {
+        "start": "node psd2tscn.js"
+    },
+    "dependencies": {
+        "ag-psd": "^15.0.0",
+        "canvas": "^3.2.1",
+        "fs-extra": "^10.1.0",
+        "minimist": "^1.2.7",
+        "pinyin-pro": "^3.16.0"
+    },
+    "engines": {
+        "node": ">=16"
+    }
+}

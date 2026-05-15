@@ -1,0 +1,18 @@
+{
+    "name": "tscn2psd",
+    "version": "0.1.0",
+    "description": "Reverse export Godot 4 .tscn scenes to PSD (with mount-info sidecar).",
+    "main": "tscn2psd.js",
+    "scripts": {
+        "start": "node tscn2psd.js"
+    },
+    "dependencies": {
+        "ag-psd": "^15.0.0",
+        "canvas": "^3.2.1",
+        "fs-extra": "^10.1.0",
+        "minimist": "^1.2.7"
+    },
+    "engines": {
+        "node": ">=16"
+    }
+}

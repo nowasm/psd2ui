@@ -1,0 +1,19 @@
+{
+    "name": "psd-ui-tools",
+    "version": "1.0.0",
+    "private": true,
+    "description": "Monorepo of CLI tools for PSD ↔ Cocos Creator prefab / Godot 4 .tscn conversion.",
+    "license": "ISC",
+    "engines": {
+        "node": ">=18.12.0 || >=20.9.0"
+    },
+    "workspaces": [
+        "psd2prefab",
+        "prefab2psd",
+        "psd2tscn",
+        "tscn2psd"
+    ],
+    "scripts": {
+        "build": "npm run build --workspace=psd2prefab"
+    }
+}

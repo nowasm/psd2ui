@@ -1,0 +1,42 @@
+[gd_scene load_steps=2 format=3 uid="uid://overflowtest123"]
+
+[ext_resource type="Texture2D" uid="uid://b1234abcdefgh" path="res://ui/btn.png" id="1_btn"]
+
+[node name="TopBar" type="Control"]
+layout_mode = 3
+anchors_preset = 0
+offset_right = 600
+offset_bottom = 100
+
+[node name="LeftEdgeBtn" type="TextureRect" parent="."]
+layout_mode = 1
+anchors_preset = 0
+offset_left = -80
+offset_top = 10
+offset_right = 40
+offset_bottom = 90
+texture = ExtResource("1_btn")
+expand_mode = 1
+stretch_mode = 0
+
+[node name="RightEdgeBtn" type="TextureRect" parent="."]
+layout_mode = 1
+anchors_preset = 0
+offset_left = 560
+offset_top = 10
+offset_right = 680
+offset_bottom = 90
+texture = ExtResource("1_btn")
+expand_mode = 1
+stretch_mode = 0
+
+[node name="DropDown" type="TextureRect" parent="."]
+layout_mode = 1
+anchors_preset = 0
+offset_left = 200
+offset_top = 80
+offset_right = 400
+offset_bottom = 200
+texture = ExtResource("1_btn")
+expand_mode = 1
+stretch_mode = 0

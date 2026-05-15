@@ -1,0 +1,15 @@
+{
+    "cc.Label": {
+        "__type__": "e4f88adp3hERoJ48DZ2PSAl",
+        "_N$file":{
+            "__uuid__": "803c185c-9442-4b99-af1a-682f877539ab"
+        },
+        "_isSystemFontUsed": false,
+        "isFixNumber": true
+    },
+    "textOffsetY":{
+        "default": -3,
+        "36": -3
+    },
+    "textLineHeightOffset": 4
+}
