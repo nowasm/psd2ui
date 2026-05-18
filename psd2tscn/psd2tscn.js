@@ -791,6 +791,357 @@
         }
     }
 
+    /** 烤 PS 图层样式 (drop shadow / inner shadow / glow / overlay / stroke) 进 raster.
+     *  ag-psd 只给我们裸 layer 像素, 样式效果在 PS 合成时渲染, 不烤就丢. 这里在 PNG 写盘前
+     *  按 PS 渲染顺序 (drop shadow → outer glow → 层 → color/gradient overlay → inner
+     *  shadow/glow → stroke) 把效果合到 canvas 上, 同时返回 padding 让 caller 扩 rect.
+     *
+     *  支持: drop shadow / outer glow / color overlay (solidFill) / gradient overlay (linear)
+     *        / inner shadow / inner glow / stroke (outside/inside/center, 单色)
+     *  不支持 (warn + skip): bevel & emboss / pattern overlay / satin / gradient overlay (radial/angle/diamond)
+     */
+    function bakeLayerEffects(srcCanvas, effects, layerName) {
+        const ZERO = { canvas: srcCanvas, padLeft: 0, padTop: 0, padRight: 0, padBottom: 0 };
+        if (!effects || effects.disabled) return ZERO;
+        const cv = canvas__default["default"];
+        const anyEnabled = (arr) => Array.isArray(arr) && arr.some(e => e && e.enabled);
+        const oneEnabled = (e) => e && e.enabled;
+
+        // === Step 1: 计算外扩 padding ===
+        let pad = { l: 0, t: 0, r: 0, b: 0 };
+        const angleToOff = (angle, dist) => {
+            const rad = ((angle || 0) * Math.PI) / 180;
+            return { x: -Math.cos(rad) * dist, y: Math.sin(rad) * dist };
+        };
+        const expandShadow = (eff) => {
+            const dist = (eff.distance && eff.distance.value) || 0;
+            const size = (eff.size && eff.size.value) || 0;
+            const off = angleToOff(eff.angle, dist);
+            pad.l = Math.max(pad.l, Math.ceil(-off.x + size));
+            pad.r = Math.max(pad.r, Math.ceil(off.x + size));
+            pad.t = Math.max(pad.t, Math.ceil(-off.y + size));
+            pad.b = Math.max(pad.b, Math.ceil(off.y + size));
+        };
+        if (anyEnabled(effects.dropShadow)) for (const ds of effects.dropShadow) if (ds.enabled) expandShadow(ds);
+        if (oneEnabled(effects.outerGlow)) {
+            const size = Math.ceil((effects.outerGlow.size && effects.outerGlow.size.value) || 0);
+            pad.l = Math.max(pad.l, size); pad.t = Math.max(pad.t, size);
+            pad.r = Math.max(pad.r, size); pad.b = Math.max(pad.b, size);
+        }
+        if (anyEnabled(effects.stroke)) {
+            for (const s of effects.stroke) {
+                if (!s.enabled) continue;
+                const sz = (s.size && s.size.value) || 0;
+                const ext = s.position === 'outside' ? sz : (s.position === 'center' ? Math.ceil(sz / 2) : 0);
+                pad.l = Math.max(pad.l, ext); pad.t = Math.max(pad.t, ext);
+                pad.r = Math.max(pad.r, ext); pad.b = Math.max(pad.b, ext);
+            }
+        }
+        const hasInterior = anyEnabled(effects.solidFill) || anyEnabled(effects.gradientOverlay)
+            || anyEnabled(effects.innerShadow) || oneEnabled(effects.innerGlow);
+        const hasStrokeInside = anyEnabled(effects.stroke) && effects.stroke.some(s => s.enabled && s.position !== 'outside');
+        const totalPad = pad.l + pad.t + pad.r + pad.b;
+        const noop = totalPad === 0 && !hasInterior && !hasStrokeInside;
+
+        // warn 不支持的效果 (无论是否 noop 都提示一次)
+        if (oneEnabled(effects.bevel)) console.warn(`bakeLayerEffects [${layerName}] bevel 不支持, 已跳过`);
+        if (oneEnabled(effects.patternOverlay)) console.warn(`bakeLayerEffects [${layerName}] patternOverlay 不支持, 已跳过`);
+        if (oneEnabled(effects.satin)) console.warn(`bakeLayerEffects [${layerName}] satin 不支持, 已跳过`);
+
+        if (noop) return ZERO;
+
+        // === Step 2: 渲染 ===
+        const W = srcCanvas.width + pad.l + pad.r;
+        const H = srcCanvas.height + pad.t + pad.b;
+        const out = cv.createCanvas(W, H);
+        const octx = out.getContext('2d');
+
+        const blendMap = { 'normal': 'source-over', 'multiply': 'multiply', 'screen': 'screen',
+            'overlay': 'overlay', 'darken': 'darken', 'lighten': 'lighten', 'colorDodge': 'color-dodge',
+            'colorBurn': 'color-burn', 'hardLight': 'hard-light', 'softLight': 'soft-light',
+            'difference': 'difference', 'exclusion': 'exclusion', 'linearDodge': 'lighter' };
+        const mapBlend = (bm) => blendMap[bm] || 'source-over';
+
+        // 把 src 的 alpha 当 mask, 生成纯色剪影
+        const colorSilhouette = (color) => {
+            const c = cv.createCanvas(srcCanvas.width, srcCanvas.height);
+            const cx = c.getContext('2d');
+            cx.drawImage(srcCanvas, 0, 0);
+            cx.globalCompositeOperation = 'source-in';
+            cx.fillStyle = `rgb(${color.r}, ${color.g}, ${color.b})`;
+            cx.fillRect(0, 0, srcCanvas.width, srcCanvas.height);
+            return c;
+        };
+        const blurCanvas = (c, r) => {
+            if (r <= 0) return c;
+            const o = cv.createCanvas(c.width, c.height);
+            const ox = o.getContext('2d');
+            ox.filter = `blur(${r}px)`;
+            ox.drawImage(c, 0, 0);
+            return o;
+        };
+
+        // --- 层下方效果: drop shadow / outer glow ---
+        if (anyEnabled(effects.dropShadow)) {
+            for (const ds of effects.dropShadow) {
+                if (!ds.enabled) continue;
+                const size = (ds.size && ds.size.value) || 0;
+                const dist = (ds.distance && ds.distance.value) || 0;
+                const off = angleToOff(ds.angle, dist);
+                const color = ds.color || { r: 0, g: 0, b: 0 };
+                const sil = colorSilhouette(color);
+                const blurred = blurCanvas(sil, size);
+                octx.save();
+                octx.globalAlpha = ds.opacity != null ? ds.opacity : 1.0;
+                octx.globalCompositeOperation = mapBlend(ds.blendMode);
+                octx.drawImage(blurred, pad.l + off.x, pad.t + off.y);
+                octx.restore();
+            }
+        }
+        if (oneEnabled(effects.outerGlow)) {
+            const og = effects.outerGlow;
+            const size = (og.size && og.size.value) || 0;
+            const color = og.color || { r: 255, g: 255, b: 255 };
+            const sil = colorSilhouette(color);
+            const blurred = blurCanvas(sil, size);
+            octx.save();
+            octx.globalAlpha = og.opacity != null ? og.opacity : 1.0;
+            octx.globalCompositeOperation = mapBlend(og.blendMode);
+            octx.drawImage(blurred, pad.l, pad.t);
+            octx.restore();
+        }
+
+        // --- 画层本体 ---
+        octx.drawImage(srcCanvas, pad.l, pad.t);
+
+        // --- 层上方覆盖效果, 自动 clip 到层 alpha (因为绘制在层之上, blend 受层 alpha 影响) ---
+        if (anyEnabled(effects.solidFill)) {
+            for (const sf of effects.solidFill) {
+                if (!sf.enabled) continue;
+                const color = sf.color || { r: 255, g: 255, b: 255 };
+                const fill = colorSilhouette(color);
+                octx.save();
+                octx.globalAlpha = sf.opacity != null ? sf.opacity : 1.0;
+                octx.globalCompositeOperation = mapBlend(sf.blendMode);
+                octx.drawImage(fill, pad.l, pad.t);
+                octx.restore();
+            }
+        }
+        if (anyEnabled(effects.gradientOverlay)) {
+            for (const go of effects.gradientOverlay) {
+                if (!go.enabled) continue;
+                const gType = go.type || 'linear';
+                if (gType !== 'linear') {
+                    console.warn(`bakeLayerEffects [${layerName}] gradient overlay type=${gType} 暂不支持, 已跳过`);
+                    continue;
+                }
+                const gradient = go.gradient;
+                if (!gradient || !gradient.colorStops) continue;
+                const w = srcCanvas.width, h = srcCanvas.height;
+                const angle = go.angle != null ? go.angle : 0;
+                const rad = angle * Math.PI / 180;
+                const dx = -Math.cos(rad), dy = Math.sin(rad);
+                const halfSpan = Math.abs((w / 2) * dx) + Math.abs((h / 2) * dy);
+                const cx0 = w / 2, cy0 = h / 2;
+                const tempC = cv.createCanvas(w, h);
+                const tcx = tempC.getContext('2d');
+                const grad = tcx.createLinearGradient(cx0 - dx * halfSpan, cy0 - dy * halfSpan, cx0 + dx * halfSpan, cy0 + dy * halfSpan);
+                for (const stop of gradient.colorStops) {
+                    const c = stop.color || { r: 255, g: 255, b: 255 };
+                    let pos = stop.location != null ? (stop.location / 4096) : (stop.position || 0);
+                    pos = Math.max(0, Math.min(1, go.reverse ? 1 - pos : pos));
+                    grad.addColorStop(pos, `rgb(${c.r},${c.g},${c.b})`);
+                }
+                tcx.fillStyle = grad;
+                tcx.fillRect(0, 0, w, h);
+                tcx.globalCompositeOperation = 'destination-in';
+                tcx.drawImage(srcCanvas, 0, 0);
+                octx.save();
+                octx.globalAlpha = go.opacity != null ? go.opacity : 1.0;
+                octx.globalCompositeOperation = mapBlend(go.blendMode);
+                octx.drawImage(tempC, pad.l, pad.t);
+                octx.restore();
+            }
+        }
+
+        // inner shadow / inner glow 两条路径分开:
+        //
+        // **inner shadow (dist > 0)**: PS-like band-subtract 算法
+        //   band = M - shifted(M, light_dir × dist) = 阴影侧内边一条宽 `dist` 的环带
+        //   然后 blur(band, size), clip 回 M. 这样阴影峰值落在边缘往内 `dist/2` 处,
+        //   而不是聚在边缘 (我之前用无限外部 source 的 bug — 阴影从边缘最强淡化, 视觉上
+        //   像没生效).
+        //
+        // **inner glow (dist == 0)**: padded-inv approach (silhouette 反相 → blur → clip)
+        //   光晕从边缘往内辐射, 峰值在边缘, 这是 inner glow 的预期视觉.
+        //
+        // light direction in canvas = (cos α, -sin α). drop shadow off = (-cos, sin). 取负相等.
+        const renderInner = (effect, forceZeroDist) => {
+            const w = srcCanvas.width, h = srcCanvas.height;
+            const dist = forceZeroDist ? 0 : ((effect.distance && effect.distance.value) || 0);
+            const size = (effect.size && effect.size.value) || 0;
+            const color = effect.color || { r: 0, g: 0, b: 0 };
+            const dropOff = angleToOff(forceZeroDist ? 0 : effect.angle, dist);
+            const lightOff = { x: -dropOff.x, y: -dropOff.y };
+
+            if (dist > 0) {
+                // band-subtract: M 减 (M 沿光方向偏移 dist) = 阴影侧内边环带
+                const padR = Math.ceil(size) + 1;
+                const pw = w + 2 * padR, ph = h + 2 * padR;
+                const band = cv.createCanvas(pw, ph);
+                const bctx = band.getContext('2d');
+                bctx.drawImage(srcCanvas, padR, padR);
+                bctx.globalCompositeOperation = 'destination-out';
+                bctx.drawImage(srcCanvas, padR + lightOff.x, padR + lightOff.y);
+                // band 现在 alpha = M 在 shifted(M) 不覆盖的位置 — 阴影侧环带
+                bctx.globalCompositeOperation = 'source-in';
+                bctx.fillStyle = `rgb(${Math.round(color.r)},${Math.round(color.g)},${Math.round(color.b)})`;
+                bctx.fillRect(0, 0, pw, ph);
+                const blurred = size > 0 ? blurCanvas(band, size) : band;
+                const out = cv.createCanvas(w, h);
+                const octx = out.getContext('2d');
+                octx.drawImage(blurred, -padR, -padR);
+                octx.globalCompositeOperation = 'destination-in';
+                octx.drawImage(srcCanvas, 0, 0);
+                return out;
+            } else {
+                // inner glow: 反 silhouette padded → blur → clip 回 M
+                const padR = Math.ceil(size) + 1;
+                const pw = w + 2 * padR, ph = h + 2 * padR;
+                const inv = cv.createCanvas(pw, ph);
+                const ictx = inv.getContext('2d');
+                ictx.fillStyle = `rgb(${Math.round(color.r)},${Math.round(color.g)},${Math.round(color.b)})`;
+                ictx.fillRect(0, 0, pw, ph);
+                ictx.globalCompositeOperation = 'destination-out';
+                ictx.drawImage(srcCanvas, padR, padR);
+                const blurred = size > 0 ? blurCanvas(inv, size) : inv;
+                const out = cv.createCanvas(w, h);
+                const octx = out.getContext('2d');
+                octx.drawImage(blurred, -padR, -padR);
+                octx.globalCompositeOperation = 'destination-in';
+                octx.drawImage(srcCanvas, 0, 0);
+                return out;
+            }
+        };
+        if (anyEnabled(effects.innerShadow)) {
+            for (const is of effects.innerShadow) {
+                if (!is.enabled) continue;
+                const inner = renderInner(is, false);
+                octx.save();
+                octx.globalAlpha = is.opacity != null ? is.opacity : 1.0;
+                octx.globalCompositeOperation = mapBlend(is.blendMode);
+                octx.drawImage(inner, pad.l, pad.t);
+                octx.restore();
+            }
+        }
+        if (oneEnabled(effects.innerGlow)) {
+            const ig = effects.innerGlow;
+            const inner = renderInner(ig, true);
+            octx.save();
+            octx.globalAlpha = ig.opacity != null ? ig.opacity : 1.0;
+            octx.globalCompositeOperation = mapBlend(ig.blendMode);
+            octx.drawImage(inner, pad.l, pad.t);
+            octx.restore();
+        }
+
+        // stroke 形态学 helper:
+        //   dilateAlpha(src, sz) -> canvas (w+2sz × h+2sz), src 在 (sz,sz) 位置, alpha 向外扩 sz 像素
+        //   erodeAlpha(src, sz)  -> canvas (w × h), src 的 alpha 向内收 sz 像素
+        //
+        // dilation 多环 stamp (concentric rings) 把整个 disk kernel 填实 — 单 perimeter 在稀疏形状
+        // 上漏 interior, 实心形状靠 stamp 重叠勉强填但不可靠. multi-ring 全 disk 覆盖.
+        //
+        // erode = !dilate(!src). 关键 bug 修: src 紧贴 layer canvas 边 (无透明 padding) 时,
+        // 原 inv 在画布内全是 0 → dilate(inv) 也接近 0 → erode 几乎不削减 → 内描边宽度 ≈ 1px.
+        // 修法: inv 先 outward-pad sz 像素 (整圈实色), src 居中放进去 (sz,sz). 这样画布外
+        // "概念上的非 src 区域" 在 inv 里有实体 alpha=1, dilate 才能正确把它扩进 src 边缘.
+        const dilateAlpha = (src, sz) => {
+            const w = src.width, h = src.height;
+            const out = cv.createCanvas(w + 2 * sz, h + 2 * sz);
+            const ctx2 = out.getContext('2d');
+            ctx2.drawImage(src, sz, sz);  // center
+            // multi-ring: r=1..sz 同心圆周 stamp, 完整填满 disk kernel
+            for (let r = 1; r <= sz; r++) {
+                const steps = Math.max(8, Math.ceil(r * 6));
+                for (let i = 0; i < steps; i++) {
+                    const a = (i / steps) * 2 * Math.PI;
+                    ctx2.drawImage(src, sz + Math.cos(a) * r, sz + Math.sin(a) * r);
+                }
+            }
+            return out;
+        };
+        const erodeAlpha = (src, sz) => {
+            const w = src.width, h = src.height;
+            // 反 alpha 同时 outward-pad sz: 实色铺满 (w+2sz, h+2sz), 减去 src (放 sz,sz 处).
+            // 让 "src 画布外的隐含 non-src 区" 在 inv 里有实体, dilate 不漏边.
+            const paddedInv = cv.createCanvas(w + 2 * sz, h + 2 * sz);
+            const pictx = paddedInv.getContext('2d');
+            pictx.fillStyle = '#000';
+            pictx.fillRect(0, 0, w + 2 * sz, h + 2 * sz);
+            pictx.globalCompositeOperation = 'destination-out';
+            pictx.drawImage(src, sz, sz);
+            // dilate padded inv: 结果 (w+4sz, h+4sz), src 原位置在 (2sz, 2sz)
+            const dilInv = dilateAlpha(paddedInv, sz);
+            // erode = src 减 dilInv. dilInv 中 src 原位区域在偏移 (2sz, 2sz), 用 (-2sz, -2sz) 对齐
+            const out = cv.createCanvas(w, h);
+            const octx2 = out.getContext('2d');
+            octx2.drawImage(src, 0, 0);
+            octx2.globalCompositeOperation = 'destination-out';
+            octx2.drawImage(dilInv, -2 * sz, -2 * sz);
+            return out;
+        };
+        if (anyEnabled(effects.stroke)) {
+            for (const s of effects.stroke) {
+                if (!s.enabled) continue;
+                const sz = (s.size && s.size.value) || 0;
+                if (sz <= 0) continue;
+                const pos = s.position || 'outside';
+                const color = s.color || { r: 0, g: 0, b: 0 };
+                const sil = colorSilhouette(color);
+                let strokeCanvas, drawOffX, drawOffY;
+                if (pos === 'outside') {
+                    // outside = dilated - src
+                    const dilated = dilateAlpha(sil, sz);
+                    const dctx = dilated.getContext('2d');
+                    dctx.globalCompositeOperation = 'destination-out';
+                    dctx.drawImage(srcCanvas, sz, sz);
+                    strokeCanvas = dilated;
+                    drawOffX = pad.l - sz;
+                    drawOffY = pad.t - sz;
+                } else if (pos === 'inside') {
+                    // inside = src - erode(src, sz) — 边缘 sz 宽的内环, 染 stroke 色
+                    const eroded = erodeAlpha(srcCanvas, sz);
+                    const out2 = cv.createCanvas(srcCanvas.width, srcCanvas.height);
+                    const o2ctx = out2.getContext('2d');
+                    o2ctx.drawImage(sil, 0, 0);  // 染色剪影 (sil 用 src 的 alpha)
+                    o2ctx.globalCompositeOperation = 'destination-out';
+                    o2ctx.drawImage(eroded, 0, 0);
+                    strokeCanvas = out2;
+                    drawOffX = pad.l;
+                    drawOffY = pad.t;
+                } else {
+                    // center: 半内半外, total = sz. dilate(half) - erode(half)
+                    const half = Math.round(sz / 2);
+                    const dilated = dilateAlpha(sil, half);  // (w+sz × h+sz)
+                    const eroded = erodeAlpha(srcCanvas, sz - half);
+                    const dctx = dilated.getContext('2d');
+                    dctx.globalCompositeOperation = 'destination-out';
+                    dctx.drawImage(eroded, half, half);
+                    strokeCanvas = dilated;
+                    drawOffX = pad.l - half;
+                    drawOffY = pad.t - half;
+                }
+                octx.save();
+                octx.globalAlpha = s.opacity != null ? s.opacity : 1.0;
+                octx.globalCompositeOperation = mapBlend(s.blendMode);
+                octx.drawImage(strokeCanvas, drawOffX, drawOffY);
+                octx.restore();
+            }
+        }
+
+        return { canvas: out, padLeft: pad.l, padTop: pad.t, padRight: pad.r, padBottom: pad.b };
+    }
+
     class PsdImage extends PsdLayer {
         constructor(source, parent, rootDoc) {
             var _a;
@@ -804,6 +1155,24 @@
                 this.s9 = Texture9Utils.safeBorder(this.source.canvas, s9);
             }
             let canvas = this.source.canvas;
+            // 把 PS 图层样式烤进 raster (drop shadow / inner shadow / glow / overlay / stroke).
+            // 9-patch + 效果组合罕见且 s9 边界跟扩边后的尺寸对不上 — 跳过 baking, 仅 warn.
+            if (this.attr.comps['.9']) {
+                if (this.source.effects && !this.source.effects.disabled) {
+                    console.warn(`PsdImage [${this.name}] @.9 + 图层样式 暂不支持组合, 效果跳过`);
+                }
+            } else if (this.source.effects) {
+                const baked = bakeLayerEffects(canvas, this.source.effects, this.name);
+                if (baked.padLeft || baked.padTop || baked.padRight || baked.padBottom || baked.canvas !== canvas) {
+                    canvas = baked.canvas;
+                    // 扩 rect: parseSource → computeBasePosition 用扩后的 rect, 让 .tscn 偏移
+                    // 自动跟扩大的纹理对齐 (描边/阴影向外延伸的部分不偏位).
+                    this.rect.left -= baked.padLeft;
+                    this.rect.top -= baked.padTop;
+                    this.rect.right += baked.padRight;
+                    this.rect.bottom += baked.padBottom;
+                }
+            }
             this.imgBuffer = canvas.toBuffer('image/png');
             this.md5 = fileUtils.getMD5(this.imgBuffer);
             this.textureSize = new Size(canvas.width, canvas.height);
@@ -865,6 +1234,16 @@
                 if (fillColor) {
                     this.color = new Color(fillColor.r, fillColor.g, fillColor.b, fillColor.a * 255);
                 }
+                // ag-psd 把字体信息放 style.font.name (PostScript 名). 这里抽出来,
+                // 后面 _fillLabelProps 判断要不要套 FontVariation embolden 模拟粗体.
+                // synthetic !== 0 说明 PSD 用了 Faux Bold/Italic (现在没碰到, 但记录上).
+                this.fontName = (style.font && style.font.name) || "";
+                this.fontSynthetic = (style.font && style.font.synthetic) || 0;
+                // 启发式判粗体: PostScript 字体名里出现这些 token 视为粗. CJK 设计字体常带 Hei/BiaoTi.
+                // 'hei' 选小写匹配会误中 "height", 但 PSD font.name 不可能出现这种英文短语.
+                const boldTokens = ['bold', 'black', 'heavy', 'extrabold', 'semibold', 'hei', 'biaoti'];
+                const lname = this.fontName.toLowerCase();
+                this.isBold = boldTokens.some(tok => lname.includes(tok)) || this.fontSynthetic === 1 || this.fontSynthetic === 3;
             }
             this.text = textSource.text;
             // 可能会对文本图层进行缩放，这里计算缩放之后的时机字体大小
@@ -874,7 +1253,10 @@
             else {
                 this.fontSize = style.fontSize;
             }
-            this.offsetY = config.textOffsetY[this.fontSize] || config.textOffsetY["default"] || 0;
+            // textOffsetY 表用整数字号 key 查询; PSD 经常出现浮点字号 (transform 缩放后),
+            // 不取整会永远查不到 → fallback default. 取整再查匹配 psd.config.json 里 "36"/"24" 这种 key.
+            const fontSizeKey = Math.round(this.fontSize);
+            this.offsetY = config.textOffsetY[fontSizeKey] || config.textOffsetY["default"] || 0;
             this.parseSolidFill();
             this.parseStroke();
             return true;
