@@ -165,6 +165,10 @@
             };
             // 行高偏移（默认 0 = 行高跟字号一致）
             this.textLineHeightOffset = 0;
+            // FontVariation embolden 强度 (faux bold), 用于 PSD 字体名含 Bold/Hei/BiaoTi 等粗体关键词时.
+            // 0 = 不包 FontVariation 直接用 ext_resource; 0.5 = 轻度加粗 (font.ttf 本身偏粗时推荐);
+            // 1.0 = 标准加粗 (font.ttf 是 Regular 字体时推荐).
+            this.boldEmboldenStrength = 0.5;
         }
     }
     const config = new Config();
@@ -1608,6 +1612,10 @@
     class GExtResRef {
         constructor(id) { this.id = id; }
     }
+    /** tscn 字面量包装：SubResource("id") — 引用同 .tscn 内 sub_resource 块 */
+    class GSubResRef {
+        constructor(id) { this.id = id; }
+    }
     /** tscn 字面量包装：NodePath("path") */
     class GNodePath {
         constructor(path) { this.path = path; }
@@ -1653,6 +1661,10 @@
             /** @type {{type:string, uid:string, path:string, id:string}[]} */
             this.extResources = [];
             this._byUid = new Map();
+            /** @type {{type:string, id:string, props:Map<string,any>}[]} */
+            this.subResources = [];
+            /** key (调用方拼好) → sub_resource 条目, 用于复用同样的 sub_resource */
+            this._subByKey = new Map();
         }
         /** 同一资源（uid 相同）只注册一次，返回同一个条目（含 id） */
         addOrGetExtResource(type, uid, resPath) {
@@ -1665,6 +1677,23 @@
             this._byUid.set(uid, entry);
             return entry;
         }
+        /**
+         * 注册/复用一个 sub_resource (FontVariation 之类), 同 key 复用.
+         * @param {string} type tscn 类型名, 如 "FontVariation"
+         * @param {string} key  调用方控制的去重 key
+         * @param {Map<string,any>} props 属性, value 可以是 GExtResRef / 数字 / Map ...
+         */
+        addOrGetSubResource(type, key, props) {
+            if (this._subByKey.has(key)) return this._subByKey.get(key);
+            const seq = this.subResources.length + 1;
+            // tscn 习惯 id 形如 "FontVariation_abcde", 跟 type 一致便于读
+            const suffix = key.replace(/[^a-zA-Z0-9_]/g, "_").substr(0, 8) || "x";
+            const id = `${type}_${suffix}`;
+            const entry = { type, id, props };
+            this.subResources.push(entry);
+            this._subByKey.set(key, entry);
+            return entry;
+        }
     }
 
     /** GodotScene → tscn 文本序列化器 */
@@ -1673,13 +1702,20 @@
         line(s) { this.lines.push(s); }
         blank() { this.lines.push(""); }
         emit(scene) {
-            const loadSteps = scene.extResources.length + 1; // ext_resources + 场景自身
+            const loadSteps = scene.extResources.length + scene.subResources.length + 1;
             this.line(`[gd_scene load_steps=${loadSteps} format=3 uid="${scene.uid}"]`);
             this.blank();
             for (const ext of scene.extResources) {
                 this.line(`[ext_resource type="${ext.type}" uid="${ext.uid}" path="${this._escapeStr(ext.path)}" id="${ext.id}"]`);
             }
             if (scene.extResources.length > 0) this.blank();
+            for (const sub of scene.subResources) {
+                this.line(`[sub_resource type="${sub.type}" id="${sub.id}"]`);
+                for (const [k, v] of sub.props) {
+                    this.line(`${k} = ${this._formatValue(v)}`);
+                }
+                this.blank();
+            }
             this._emitNode(scene.root);
             return this.lines.join("\n");
         }
@@ -1704,6 +1740,7 @@
             if (v instanceof GVec2) return `Vector2(${this._fmtNum(v.x)}, ${this._fmtNum(v.y)})`;
             if (v instanceof GColor) return `Color(${this._fmtNum(v.r)}, ${this._fmtNum(v.g)}, ${this._fmtNum(v.b)}, ${this._fmtNum(v.a)})`;
             if (v instanceof GExtResRef) return `ExtResource("${v.id}")`;
+            if (v instanceof GSubResRef) return `SubResource("${v.id}")`;
             if (v instanceof GNodePath) return `NodePath("${this._escapeStr(v.path)}")`;
             if (typeof v === "boolean") return v ? "true" : "false";
             if (typeof v === "number") return this._fmtNum(v);
@@ -2073,13 +2110,28 @@
             const parentLeft = layer.parent ? layer.parent.rect.left : 0;
             const parentTop = layer.parent ? layer.parent.rect.top : 0;
             const x = layer.rect.left - parentLeft;
-            const y = layer.rect.top - parentTop;
+            // Label rect 调整: PSD text bbox 紧贴 cap+descender (≈ fontSize × 0.7~0.85), Godot
+            // line box = ascent + descent + leading (≈ fontSize × 1.2~1.4, CJK 字体甚至更高).
+            // bbox 比 line box 矮一截 → vertical_alignment=TOP 时字会从 control.top + ascent 起算
+            // baseline, 大幅溢出 control 下方. 修法: 把 Label rect 扩到至少 fontSize × 1.4 高,
+            // 围绕原 bbox 中心上下对称扩张, 再让 _fillLabelProps 设 vertical_alignment=CENTER,
+            // 字在扩开的 rect 内自然居中. offsetY (textOffsetY) 保留作残差微调.
+            // anchors_preset=0 模式下 rect 是 absolute offset, 扩 height 仅改 Label 自己边界,
+            // 不影响兄弟和父节点布局 (Godot 不画 control 边框).
+            const isLabel = node.type === "Label";
+            const fontSizeForBox = (isLabel && layer.fontSize) ? layer.fontSize : 0;
+            const lineBoxH = Math.ceil(fontSizeForBox * 1.4);
+            const expandH = isLabel && lineBoxH > h ? lineBoxH - h : 0;
+            const expandTop = Math.floor(expandH / 2);
+            const yAdjust = (isLabel && layer.offsetY) ? layer.offsetY : 0;
+            const y = layer.rect.top - parentTop + yAdjust - expandTop;
+            const finalH = h + expandH;
             node.setProp("layout_mode", 1);
             node.setProp("anchors_preset", 0);
             if (x !== 0) node.setProp("offset_left", x);
             if (y !== 0) node.setProp("offset_top", y);
             node.setProp("offset_right", x + w);
-            node.setProp("offset_bottom", y + h);
+            node.setProp("offset_bottom", y + finalH);
         }
         /** 处理 PsdImage 类图层的 texture/9-patch/flip。覆盖 NinePatchRect 与 TextureRect 两条路径 */
         _fillImageProps(node, layer, scene) {
@@ -2120,10 +2172,24 @@
             if (layer.color) {
                 node.setProp("theme_override_colors/font_color", GColor.fromBytes(layer.color));
             }
-            // 默认字体（如果配置了）。Label 上写 theme_override_fonts/font 覆盖主题默认
+            // 默认字体（如果配置了）。Label 上写 theme_override_fonts/font 覆盖主题默认.
+            // 粗体字层用 FontVariation 包一层 + variation_embolden 模拟 (faux bold), 不需要额外字体文件.
+            // embolden=1.0 视觉接近常见粗体, 极粗设计字 (Black/Heavy) 可后续按 fontName 微调.
             if (this.defaultFontUid && scene) {
                 const ext = scene.addOrGetExtResource(this.defaultFontType, this.defaultFontUid, this.defaultFontPath);
-                node.setProp("theme_override_fonts/font", new GExtResRef(ext.id));
+                const strength = config.boldEmboldenStrength;
+                if (layer.isBold && strength > 0) {
+                    // strength 进 sub_resource key 一起去重: 同强度共享一个 FontVariation
+                    const strKey = String(strength).replace(".", "_");
+                    const sub = scene.addOrGetSubResource("FontVariation", `bold_${ext.id}_${strKey}`, new Map([
+                        ["base_font", new GExtResRef(ext.id)],
+                        ["variation_embolden", strength],
+                    ]));
+                    node.setProp("theme_override_fonts/font", new GSubResRef(sub.id));
+                } else {
+                    // strength=0 或非粗体: 直接用 ext_resource, 不产生多余 sub_resource
+                    node.setProp("theme_override_fonts/font", new GExtResRef(ext.id));
+                }
             }
             // 文本描边
             if (layer.outline) {
@@ -2134,7 +2200,9 @@
                 }
             }
             node.setProp("horizontal_alignment", 0);
-            node.setProp("vertical_alignment", 0);
+            // CENTER: 配合 _fillRectProps 扩开的 Label rect, 字在 line box 范围内垂直居中.
+            // 取代之前 TOP + textOffsetY 经验补偿的脆弱方案.
+            node.setProp("vertical_alignment", 1);
             node.setProp("autowrap_mode", 0);
         }
         _uniqueChildName(parentNode, name) {
