@@ -169,6 +169,9 @@
             // 0 = 不包 FontVariation 直接用 ext_resource; 0.5 = 轻度加粗 (font.ttf 本身偏粗时推荐);
             // 1.0 = 标准加粗 (font.ttf 是 Regular 字体时推荐).
             this.boldEmboldenStrength = 0.5;
+            // Label 描边宽度乘数. PSD stroke.size 直接映射 Godot outline_size 时视觉偏淡 (Godot
+            // outline 渲染算法跟 PS stroke 不等价). 1.0 = 旧行为 1:1 映射; 1.5~2.0 接近 PSD 视觉.
+            this.outlineWidthMultiplier = 1.0;
         }
     }
     const config = new Config();
@@ -2191,9 +2194,11 @@
                     node.setProp("theme_override_fonts/font", new GExtResRef(ext.id));
                 }
             }
-            // 文本描边
+            // 文本描边. Godot outline 渲染比 PS stroke 视觉淡, config.outlineWidthMultiplier
+            // 允许整体放大 (默认 1.0 保留旧行为, 项目级 psd.config.json 可调到 1.5~2.0).
             if (layer.outline) {
-                const w = Math.max(1, Math.round(layer.outline.width || 0));
+                const rawW = (layer.outline.width || 0) * (config.outlineWidthMultiplier || 1.0);
+                const w = Math.max(1, Math.round(rawW));
                 node.setProp("theme_override_constants/outline_size", w);
                 if (layer.outline.color) {
                     node.setProp("theme_override_colors/font_outline_color", GColor.fromBytes(layer.outline.color));
