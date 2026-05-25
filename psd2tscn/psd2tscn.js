@@ -355,9 +355,11 @@
         add(psdImage) {
             var _a;
             // 不忽略导出图片
+            // 按像素 MD5 去重: 同名但内容不同的图层 (e.g. 多个 chat_bubble_sm 含镜像 / 不同样式)
+            // 必须各自独立, 否则后导出的会被前导出的同名 entry 覆盖, scene 引用到错图.
             if (!psdImage.isIgnore() && !psdImage.isBind()) {
-                if (!this._imageMapMd5Key.has(psdImage.name)) {
-                    this._imageMapMd5Key.set(psdImage.name, psdImage);
+                if (!this._imageMapMd5Key.has(psdImage.md5)) {
+                    this._imageMapMd5Key.set(psdImage.md5, psdImage);
                 }
             }
             if (typeof ((_a = psdImage.attr.comps.img) === null || _a === void 0 ? void 0 : _a.id) != "undefined") {
@@ -380,7 +382,9 @@
         handleSameImgName(psdImage, imgName, idx) {
             if (this._imageMapImgNameKey.has(imgName)) {
                 let _psdImage = this._imageMapImgNameKey.get(imgName);
-                if (_psdImage.name != psdImage.name) {
+                // 按 md5 判同: 同 md5 直接复用文件名 (不同层但像素一致 → 共用 png);
+                // 不同 md5 → 加 _R<idx> 后缀避免覆盖, 即便 layer.name 相同 (e.g. 多个气泡变体)
+                if (_psdImage.md5 !== psdImage.md5) {
                     this.handleSameImgName(psdImage, `${psdImage.imgName}_R${idx}`, idx + 1);
                 }
                 else {
@@ -1368,10 +1372,11 @@
                         // Image
                         let image = layer = new PsdImage(source, parent, rootDoc);
                         imageMgr.add(image);
-                        // 没有设置忽略且不说镜像的情况下才进行缓存
+                        // imageMgr.add → handleSameImgName 已根据 md5 把 imgName 处理出唯一文件名
+                        // (e.g. chat_bubble_sm vs chat_bubble_sm_R0), 这里用 imgName 入缓存才能跟磁盘 .png 对齐
                         if (!image.isIgnore() && !image.isBind()) {
-                            if (!imageCacheMgr.has(image.name)) {
-                                imageCacheMgr.set(image.name, {
+                            if (!imageCacheMgr.has(image.imgName)) {
+                                imageCacheMgr.set(image.imgName, {
                                     uuid: image.uuid,
                                     textureUuid: image.textureUuid,
                                 });
@@ -1885,7 +1890,7 @@
                 let images = imageMgr.getAllImage();
                 images.forEach((psdImage, k) => {
                     let _layer = imageMgr.getSerialNumberImage(psdImage);
-                    let imageWarp = imageCacheMgr.get(_layer.name);
+                    let imageWarp = imageCacheMgr.get(_layer.imgName);
                     if (!this.isForceImg) {
                         if (imageWarp && imageWarp.isOutput && this._isGodotUid(imageWarp.uuid)) {
                             console.log(`已有相同资源，不再导出 [${psdImage.imgName}] name: ${psdImage.name}`);
@@ -1902,7 +1907,7 @@
         /** 写 .png.import 文件，并把 godotUid 回写到 imageCacheMgr */
         saveImageImport(layer, pngPath) {
             let _layer = imageMgr.getSerialNumberImage(layer);
-            let imageWarp = imageCacheMgr.get(_layer.name);
+            let imageWarp = imageCacheMgr.get(_layer.imgName);
             // 若没有缓存或缓存里是 Cocos uuid（parser 阶段的占位），重新生成 Godot uid
             if (!imageWarp || !this._isGodotUid(imageWarp.uuid)) {
                 const newUid = utils.godotUid();
@@ -1912,7 +1917,7 @@
                     textureUuid: newUid,
                     isOutput: true,
                 };
-                imageCacheMgr.set(_layer.name, imageWarp);
+                imageCacheMgr.set(_layer.imgName, imageWarp);
             } else {
                 imageWarp.path = this.toResPath(pngPath);
                 imageWarp.isOutput = true;
@@ -2141,9 +2146,9 @@
             // 忽略图片标记的图层：保留节点位置但不设贴图
             if (layer.isIgnore && layer.isIgnore()) return;
             const _layer = imageMgr.getSerialNumberImage(layer);
-            const imageWarp = imageCacheMgr.get(_layer.name);
+            const imageWarp = imageCacheMgr.get(_layer.imgName);
             if (!imageWarp) {
-                console.warn(`GodotExporter-> 图层 ${_layer.name} 没有缓存的 uid，texture 留空`);
+                console.warn(`GodotExporter-> 图层 ${_layer.name} (imgName=${_layer.imgName}) 没有缓存的 uid，texture 留空`);
                 return;
             }
             const ext = scene.addOrGetExtResource("Texture2D", imageWarp.uuid, imageWarp.path);
