@@ -166,9 +166,10 @@
             // 行高偏移（默认 0 = 行高跟字号一致）
             this.textLineHeightOffset = 0;
             // FontVariation embolden 强度 (faux bold), 用于 PSD 字体名含 Bold/Hei/BiaoTi 等粗体关键词时.
-            // 0 = 不包 FontVariation 直接用 ext_resource; 0.5 = 轻度加粗 (font.ttf 本身偏粗时推荐);
-            // 1.0 = 标准加粗 (font.ttf 是 Regular 字体时推荐).
-            this.boldEmboldenStrength = 0.5;
+            // 0 = 不包 FontVariation 直接用 ext_resource; 0.2 = 轻度加粗 (中文 + 偏粗字体推荐, 防笔画黏连);
+            // 0.5 = 中度加粗; 1.0 = 标准加粗 (font.ttf 是 Regular 字体时推荐).
+            // Godot embolden 合理范围 0.0–0.3, 高于 0.3 笔画间空隙容易被填满 (中文 "回/局/玩" 类字).
+            this.boldEmboldenStrength = 0.2;
             // Label 描边宽度乘数. PSD stroke.size 直接映射 Godot outline_size 时视觉偏淡 (Godot
             // outline 渲染算法跟 PS stroke 不等价). 1.0 = 旧行为 1:1 映射; 1.5~2.0 接近 PSD 视觉.
             this.outlineWidthMultiplier = 1.0;
@@ -1182,6 +1183,47 @@
                     this.rect.top -= baked.padTop;
                     this.rect.right += baked.padRight;
                     this.rect.bottom += baked.padBottom;
+                }
+            }
+            // === 裁剪超出 PSD 画布的像素 ===
+            // PSD 里 layer 可以画到画布外 (设计师 sloppy / 用了大图素材没 trim),
+            // ag-psd 读出的 layer canvas 是完整像素含画布外部分. 不裁掉会让 Godot
+            // 加载出 "超出设计稿" 的图, 占用更多内存 + 视觉上摆位不对.
+            // 这里按 PSD 画布 [0, docW] x [0, docH] 裁掉 layer rect 越界的部分.
+            if (this.rootDoc && this.rootDoc.size) {
+                const docW = this.rootDoc.size.width;
+                const docH = this.rootDoc.size.height;
+                const r = this.rect;
+                const overflowLeft = r.left < 0 ? -r.left : 0;
+                const overflowTop = r.top < 0 ? -r.top : 0;
+                const overflowRight = r.right > docW ? r.right - docW : 0;
+                const overflowBottom = r.bottom > docH ? r.bottom - docH : 0;
+                if (overflowLeft || overflowTop || overflowRight || overflowBottom) {
+                    const newW = canvas.width - overflowLeft - overflowRight;
+                    const newH = canvas.height - overflowTop - overflowBottom;
+                    if (newW > 0 && newH > 0) {
+                        const cv = canvas__default["default"];
+                        const cropped = cv.createCanvas(newW, newH);
+                        const cctx = cropped.getContext('2d');
+                        cctx.drawImage(canvas, -overflowLeft, -overflowTop);
+                        canvas = cropped;
+                        r.left += overflowLeft;
+                        r.top += overflowTop;
+                        r.right -= overflowRight;
+                        r.bottom -= overflowBottom;
+                        console.log(`PsdImage [${this.name}] 裁掉画布外像素: ` +
+                            `L${overflowLeft} T${overflowTop} R${overflowRight} B${overflowBottom}, ` +
+                            `新尺寸 ${newW}x${newH}`);
+                    } else {
+                        // layer 完全在画布外 — 给个 1x1 透明 placeholder, 防止 toBuffer 报错
+                        const cv = canvas__default["default"];
+                        canvas = cv.createCanvas(1, 1);
+                        r.left = 0;
+                        r.top = 0;
+                        r.right = 1;
+                        r.bottom = 1;
+                        console.warn(`PsdImage [${this.name}] 完全在画布外, 用 1x1 透明占位`);
+                    }
                 }
             }
             this.imgBuffer = canvas.toBuffer('image/png');
